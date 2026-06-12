@@ -2,10 +2,7 @@
 
 Bash script that automates the full WPA/WPA2 audit workflow with the **Aircrack-ng** suite: network scan, handshake capture, deauthentication, and wordlist cracking.
 
-<video autoplay loop muted playsinline width="100%">
-  <source src="https://raw.githubusercontent.com/LeucoByte/mcwfcrk/main/demo.mp4" type="video/mp4">
-  <source src="./demo.mp4" type="video/mp4">
-</video>
+https://github.com/user-attachments/assets/a01b60d1-3bf5-482b-baae-dc2434676660
 
 ## Download
 
