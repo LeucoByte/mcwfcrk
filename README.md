@@ -1,107 +1,117 @@
-# MCWFCRK — Marco Calvo WiFi Cracker
+# MCWFCRK
+### Marco Calvo WiFi Cracker
 
-Automated WPA/WPA2 security auditing tool for Linux. One script handles monitor mode, target selection, capture, cracking, and cleanup.
+Bash script that automates WPA/WPA2-PSK audits on Linux: monitor mode, pick a target, capture, crack, cleanup. One run, less babysitting.
 
-## Attack modes
+Only use this on networks you own or have **explicit permission** to test. Seriously.
 
-### HANDSHAKE (default)
-
-Captures the WPA four-way handshake on the target channel and forces a reconnect with deauth frames. **Requires a client connected to the AP.** Cracked with `aircrack-ng`. Default: 5 deauth packets (`-d` to increase).
-
-### PMKID
-
-Captures a PMKID from the access point **without any connected clients**. Runs `hcxdumptool` on the detected channel, converts to `.hc22000`, filters to your target BSSID, and cracks with `hashcat`. Not every router exposes a usable PMKID.
-
-## Compatibility
-
-WPA/WPA2 **PSK** networks only. No WPA3, enterprise (802.1X), or open networks.
-
-| Target | HANDSHAKE | PMKID |
-|--------|-----------|-------|
-| WPA2-PSK | Yes | Often |
-| WPA-PSK | Yes | Sometimes |
-| WPA3 / Enterprise / Open | No | No |
-
-## Features
-
-- Non-disruptive — does not stop NetworkManager
-- Interactive scan or fully scripted with `-b` / `-e`
-- Automatic channel detection and monitor cleanup on exit
-- Auto-install of missing tools on Debian/Ubuntu (`apt-get`)
-
-## Network interface note
-
-One adapter in monitor mode cannot stay on your WiFi at the same time. A **USB adapter** for the attack is recommended. If the script enabled monitor mode, it deactivates it on exit.
-
-## Installation
+## Install
 
 ```bash
 curl -LO https://raw.githubusercontent.com/LeucoByte/mcwfcrk/main/mcwfcrk.sh
 chmod +x mcwfcrk.sh
 ```
 
-## Usage
+## Quick run
 
 ```bash
-# Minimum — interactive scan, you pick BSSID or ESSID at the prompt
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt
-
-# PMKID with defaults (45 s timeout)
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID
-
-# PMKID — interface, ESSID, custom timeout
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -t 60 -i wlp0s20f3 -e H3601P_DA00
-
-# HANDSHAKE — more deauth packets, same target
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a HANDSHAKE -d 10 -i wlp0s20f3 -e H3601P_DA00
-
-# BSSID known — skip scan and prompt
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -b 48:22:54:B1:6E:03 -i wlp0s20f3
-
-# Save captures for later
-sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -e H3601P_DA00 -o ./captures
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt
 ```
 
-| Option | Description |
-|--------|-------------|
-| `-w`, `--wordlist` | Path to wordlist (**required**) |
-| `-b`, `--bssid` | Target MAC — skips scan window and prompt |
-| `-e`, `--essid` | Network name — silent scan resolves ESSID → BSSID |
-| `-i`, `--interface` | WiFi interface (activates monitor mode if needed) |
-| `-a`, `--attack-mode` | `HANDSHAKE` (default) or `PMKID` |
-| `-d`, `--deauth` | Deauth packets in HANDSHAKE mode (default: 5, max: 256) |
-| `-t`, `--timeout` | PMKID capture timeout in seconds (default: 45) |
-| `-o`, `--output` | Directory to keep `.cap` / `.pcapng` / `.hc22000` files |
-| `-h`, `--help` | Show usage |
+Opens a scan window, you type a BSSID or ESSID, it does the rest.
 
-Use `-b` or `-e`, not both. Without either, the script opens a scan window and prompts for BSSID or ESSID.
+**Heads up:** one card in monitor mode can't stay on your normal WiFi at the same time. USB adapter for the attack, built-in for internet, works great.
 
-### Channel detection
+---
 
-After the BSSID is known, a targeted `airodump-ng` scan runs for up to **30 seconds** to read the channel from CSV. PMKID capture then locks `hcxdumptool` to that channel (e.g. `6a` on 2.4 GHz).
+## Modes
 
-If detection fails: weak signal, wrong BSSID (dual-band routers have one MAC per band), or ESSID name mismatch with `-e`.
+### HANDSHAKE (default)
 
-### Saving captures (`-o`)
+Needs someone connected to the AP (or you wait until someone connects). Cracks with `aircrack-ng`. Also needs `tcpdump` (auto-installed on Debian/Ubuntu if missing).
 
-Without `-o`, files live in `/tmp` and are removed on exit. With `-o`, keep them to retry hashcat/aircrack with another wordlist without recapturing.
+What it actually does:
 
-## How it works
+1. `airodump-ng` on the target channel in an xterm. CSV updates every second.
+2. Main loop keeps watching for **new clients** and **handshakes** at the same time.
+3. New client shows up → deauth **once per MAC**, queued so only one `aireplay-ng` runs at a time. Each attack gets its own xterm; window closes when done.
+4. Handshake lands → every deauth xterm dies on the spot. Script tries to print which client it came from (EAPOL in the `.cap` via `tcpdump`, CSV as backup).
+5. All known clients deauthed and nothing running → **30s countdown** in the terminal (`No clients detected… until broadcast deauth`). Timer resets if a new client appears or the last deauth just finished.
+6. Still nothing → **broadcast deauth**, then **30s last opportunity** (countdown starts when that xterm closes, not before).
+7. Got the handshake → `aircrack-ng` in xterm with your wordlist. Password shows up in the main terminal.
 
-1. Monitor mode on the chosen interface (`-i` or auto-detect).
-2. Target: interactive prompt, `-b`, or `-e` (silent scan).
-3. Channel detection from BSSID.
-4. **HANDSHAKE** — `airodump-ng` + directed/broadcast deauth, then `aircrack-ng`.
-5. **PMKID** — `hcxdumptool` on target channel → `hcxpcapngtool` → filter hash to your BSSID → `hashcat`.
-6. Password printed in the main terminal; cleanup on exit.
+Default is 5 deauth packets per attack. Bump with `-d` (max 256).
 
-## Requirements
+### PMKID
 
-- Linux with X11
-- Root / `sudo`
-- WiFi adapter with monitor mode (packet injection needed for HANDSHAKE)
-- Your own wordlist
+No client required. Sniffs a PMKID from the AP itself. Cracks with `hashcat` mode 22000. Not every router plays nice with this.
+
+1. Same channel detection as HANDSHAKE.
+2. `hcxdumptool` on that channel (xterm).
+3. Countdown in the main terminal (`-t`, default 45s). Stops early if your BSSID's PMKID shows up.
+4. `hcxpcapngtool` → `.hc22000`, trimmed to your AP only.
+5. `hashcat` in xterm, password in the main terminal.
+
+---
+
+WPA/WPA2 **PSK** only. No WPA3, no enterprise/802.1X, no open networks.
+
+| | HANDSHAKE | PMKID |
+|---|-----------|-------|
+| Client needed | Usually yes | No |
+| Cracker | aircrack-ng | hashcat |
+| Extra tools | tcpdump | hcxdumptool, hcxpcapngtool, hashcat |
+
+---
+
+## Examples
+
+```bash
+# Minimum. Interactive scan, you pick target at the prompt
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt
+
+# PMKID, defaults (45s timeout)
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID
+
+# PMKID. Your interface, ESSID, longer wait
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -t 60 -i wlp0s20f3 -e H3601P_DA00
+
+# HANDSHAKE. Less deauth packets, same target
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a HANDSHAKE -d 3 -i wlp0s20f3 -e H3601P_DA00
+
+# BSSID already known, skip the prompt
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -b 30:1F:48:0E:DA:00 -i wlp0s20f3
+
+# Save captures instead of /tmp cleanup
+sudo ./mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -e MiFibra-7BE7 -o ./captures
+```
+
+## Options
+
+| Flag | What it does |
+|------|----------------|
+| `-w`, `--wordlist` | Wordlist path. Required. |
+| `-b`, `--bssid` | Target MAC. Skips scan window and prompt. |
+| `-e`, `--essid` | Network name. Silent scan finds the BSSID for you. |
+| `-i`, `--interface` | WiFi iface (e.g. `wlp0s20f3`). Monitor mode if needed. |
+| `-a`, `--attack-mode` | `HANDSHAKE` or `PMKID` |
+| `-d`, `--deauth` | Packets per deauth in HANDSHAKE mode (default 5) |
+| `-t`, `--timeout` | PMKID capture seconds (default 45) |
+| `-o`, `--output` | Folder to keep `.cap` / `.pcapng` / `.hc22000` files |
+| `-h`, `--help` | Help |
+
+`-b` or `-e`, not both.
+
+## Misc
+
+**Channel:** after the BSSID is known, script runs a short `airodump-ng` on that AP and reads the channel from CSV. PMKID passes it to `hcxdumptool` as `${channel}a` (20 MHz width, e.g. channel 6 → `6a`, channel 36 → `36a`).
+
+**Files:** no `-o` → everything in `/tmp`, deleted on exit. With `-o` → keep captures and retry hashcat/aircrack with another wordlist without capturing again.
+
+**Cleanup:** kills xterm windows, stops monitor mode if the script started it, cursor back to normal.
+
+**Deps:** Linux, X11, xterm, root/sudo, monitor-capable WiFi (injection needed for HANDSHAKE deauth). Missing packages on Debian/Ubuntu get pulled via `apt-get` when possible.
 
 ## Disclaimer
 
-**For authorized security testing only.** Use only on networks you own or have explicit written permission to test. The author provides this tool as-is with no warranty and accepts no liability for misuse or consequences.
+Tool provided as-is. No warranty. Author not liable for misuse or whatever breaks because you pointed this at the wrong network.
