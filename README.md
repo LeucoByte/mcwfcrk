@@ -1,5 +1,4 @@
-# MCWFCRK
-### Marco Calvo WiFi Cracker
+# mcwfcrk — Marco Calvo WiFi Cracker
 
 Bash script that automates WPA/WPA2-PSK audits on Linux: monitor mode, pick a target, capture, crack, cleanup. One run, less babysitting.
 
