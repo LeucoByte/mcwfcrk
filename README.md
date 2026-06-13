@@ -10,7 +10,7 @@ Designed for penetration testers and security researchers who need a straightfor
 
 The classic WPA attack. When a device connects to an access point, they exchange a four-way handshake that contains the material needed to verify the password offline.
 
-MCWFCRK captures that handshake by listening on the target channel and sending deauthentication frames to force a connected client to reconnect. **A client must be associated with the AP during the attack** — if nobody is connected, there is no handshake to capture.
+MCWFCRK captures that handshake by listening on the target channel and sending deauthentication frames to force a connected client to reconnect. **A client must be associated with the AP during the attack** — if nobody is connected, there is no handshake to capture. By default 5 deauth packets are sent; increase with `-d` if the handshake is not captured on the first attempt.
 
 Cracked with `aircrack-ng`.
 
@@ -66,19 +66,22 @@ curl -LO https://raw.githubusercontent.com/LeucoByte/mcwfcrk/main/mcwfcrk.sh
 chmod +x mcwfcrk.sh
 ```
 
-## Usage
+## Examples
 
 ```bash
-sudo ./mcwfcrk.sh -w /path/to/your/wordlist.txt
-sudo ./mcwfcrk.sh -w /path/to/your/wordlist.txt -a PMKID
-sudo ./mcwfcrk.sh -w /path/to/your/wordlist.txt -a PMKID -t 60
-sudo ./mcwfcrk.sh -w /path/to/your/wordlist.txt -o ./captures
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a HANDSHAKE -d 30
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a HANDSHAKE -d 30 -o ./captures
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -t 300
+sudo bash mcwfcrk.sh -w /usr/share/wordlists/rockyou.txt -a PMKID -t 300 -o ./captures
 ```
 
 | Option | Description |
 |--------|-------------|
 | `-w`, `--wordlist` | Path to wordlist (required) |
 | `-a`, `--attack-mode` | `HANDSHAKE` (default) or `PMKID` |
+| `-d`, `--deauth` | Deauth packets to send in HANDSHAKE mode (default: 5, max: 256) |
 | `-t`, `--timeout` | PMKID capture timeout **in seconds** (default: 45) |
 | `-o`, `--output` | Directory to save capture and hash files |
 | `-h`, `--help` | Show usage |
